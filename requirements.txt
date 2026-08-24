@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
-"pipecat-ai[websocket]"
+pipecat-ai[websocket]
 soxr
 loguru
