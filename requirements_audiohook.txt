@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pipecat-ai[websocket]
+soxr
+loguru
+azure-cognitiveservices-speech
