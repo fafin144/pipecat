@@ -18,9 +18,11 @@ import os
 from fastapi import FastAPI, WebSocket
 from loguru import logger
 
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.genesys import AudioHookChannel, GenesysAudioHookSerializer
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
@@ -28,6 +30,26 @@ from pipecat.transports.websocket.fastapi import (
 )
 
 app = FastAPI()
+
+
+class EchoAudio(FrameProcessor):
+    """Turns incoming InputAudioRawFrame into OutputAudioRawFrame so the
+    output transport is actually allowed to send it back out. Everything
+    else (StartFrame, EndFrame, etc.) is passed through unchanged."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            await self.push_frame(
+                OutputAudioRawFrame(
+                    audio=frame.audio,
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                ),
+                direction,
+            )
+        else:
+            await self.push_frame(frame, direction)
 
 
 @app.get("/")
@@ -59,7 +81,9 @@ async def audiohook_endpoint(websocket: WebSocket, session_id: str) -> None:
 
     # Simplest possible pipeline: whatever comes in on this leg goes
     # straight back out on the same leg. Pure echo, no translation yet.
-    pipeline = Pipeline([transport.input(), transport.output()])
+    # EchoAudio converts InputAudioRawFrame -> OutputAudioRawFrame, which
+    # is required - output transports only ever send OutputAudioRawFrame.
+    pipeline = Pipeline([transport.input(), EchoAudio(), transport.output()])
     task = PipelineTask(pipeline)
     runner = PipelineRunner()
 
