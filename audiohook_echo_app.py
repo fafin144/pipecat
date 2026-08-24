@@ -35,10 +35,10 @@ async def health() -> dict:
     return {"status": "ok", "endpoint": "wss://<this-host>/audiohook"}
 
 
-@app.websocket("/audiohook")
-async def audiohook_endpoint(websocket: WebSocket) -> None:
+@app.websocket("/audiohook/{session_id}")
+async def audiohook_endpoint(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
-    logger.info("Genesys AudioHook connection accepted")
+    logger.info(f"Genesys AudioHook connection accepted, session_id={session_id}")
 
     serializer = GenesysAudioHookSerializer(
         params=GenesysAudioHookSerializer.InputParams(
