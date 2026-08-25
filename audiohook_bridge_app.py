@@ -10,11 +10,16 @@ Single-pair only (matches the agreed MVP scope): a simple broker pairs
 the first connection with the second. If a third connects while a pair
 is already active, it becomes the new "waiting" leg for the next pair.
 
-Which language a leg translates INTO is decided by a query parameter on
-the WSS URL, not by connection order - set this per Architect flow:
+Which language a leg translates INTO is decided by a path segment on the
+WSS URL, not by connection order - set this per Architect flow. Genesys
+appends "/<call-id>" to whatever URL you configure, so the language must
+be a clean path segment BEFORE that, not a query parameter (a query
+parameter gets mangled since Genesys just concatenates the call id onto
+the end of the string you gave it, "?target=en" + "/<uuid>" -> broken
+"?target=en/<uuid>"):
 
-  Flow A (Czech speaker)   -> wss://<host>/audiohook?target=en
-  Flow B (English speaker) -> wss://<host>/audiohook?target=cs
+  Flow A (Czech speaker)   -> wss://<host>/audiohook/en
+  Flow B (English speaker) -> wss://<host>/audiohook/cs
 
 Required Render environment variables:
   AZURE_SPEECH_KEY
@@ -182,12 +187,11 @@ broker = PairBroker()
 
 @app.get("/")
 async def health() -> dict:
-    return {"status": "ok", "endpoint": "wss://<this-host>/audiohook?target=en|cs"}
+    return {"status": "ok", "endpoint": "wss://<this-host>/audiohook/en or /audiohook/cs"}
 
 
-@app.websocket("/audiohook/{session_id}")
-async def audiohook_endpoint(websocket: WebSocket, session_id: str) -> None:
-    target_language = websocket.query_params.get("target", "en")
+@app.websocket("/audiohook/{target_language}/{session_id}")
+async def audiohook_endpoint(websocket: WebSocket, target_language: str, session_id: str) -> None:
     label = f"leg[target={target_language}]-{session_id[:8]}"
 
     await websocket.accept()
