@@ -156,14 +156,27 @@ class PairBroker:
     """Pairs the first waiting leg with the next one that connects.
     Single pair at a time - matches the agreed proof-of-concept scope."""
 
+    STALE_AFTER_SECONDS = 120.0
+
     def __init__(self) -> None:
         self._waiting: Optional[TranslateAudio] = None
+        self._waiting_since: float = 0.0
         self._lock = asyncio.Lock()
 
     async def register(self, leg: TranslateAudio) -> None:
         async with self._lock:
+            if self._waiting is not None:
+                age = asyncio.get_running_loop().time() - self._waiting_since
+                if age > self.STALE_AFTER_SECONDS:
+                    logger.warning(
+                        f"[{self._waiting.label}] was waiting {age:.0f}s with no partner - "
+                        f"treating as stale, discarding before pairing [{leg.label}]"
+                    )
+                    self._waiting = None
+
             if self._waiting is None:
                 self._waiting = leg
+                self._waiting_since = asyncio.get_running_loop().time()
                 logger.info(f"[{leg.label}] connected, waiting for partner leg...")
             else:
                 partner = self._waiting
@@ -213,13 +226,18 @@ async def audiohook_endpoint(websocket: WebSocket, target_language: str, session
         ),
     )
 
-    pipeline = Pipeline([transport.input(), TranslateAudio(target_language, label), transport.output()])
+    processor = TranslateAudio(target_language, label)
+    pipeline = Pipeline([transport.input(), processor, transport.output()])
     task = PipelineTask(pipeline)
     runner = PipelineRunner()
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client) -> None:
         logger.info(f"[{label}] AudioHook session closed")
+        # Force cleanup here regardless of whether EndFrame ever cleanly
+        # reached the processor - a dropped/abrupt disconnect must not
+        # leave a stale entry in the broker for the next call to pair with.
+        await broker.unregister(processor)
         await task.cancel()
 
     await runner.run(task)
