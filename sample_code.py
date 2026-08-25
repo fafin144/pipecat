@@ -29,8 +29,8 @@ DEFAULT_TARGET_LANGUAGE = "fr"
 DEFAULT_PREBUILT_VOICES = {
     "fr": "fr-FR-DeniseNeural",
     "en": "en-US-JennyNeural",
-    "cs": "en-US-Ava:DragonHDLatestNeural",
-    "cz": "en-US-Ava:DragonHDLatestNeural",
+    "cs": "cs-CZ-AntoninNeural",
+    "cz": "cs-CZ-AntoninNeural",
 }
 SYNTHESIS_LOCALES = {
     "fr": "fr-FR",
@@ -416,15 +416,17 @@ def create_translation_components(
         )
     translation_config.set_speech_synthesis_output_format(output_format)
 
-    # In Python, omitting both constructor arguments selects open-range
-    # detection; the static FromOpenRange method exists only in other SDKs.
+    # Restrict auto-detection to the languages we actually expect on a call
+    # leg (Czech/English), instead of open-range detection across every
+    # language Azure supports. This improves both accuracy and latency
+    # when we already know the candidate set.
     auto_detect_type = speechsdk.languageconfig.AutoDetectSourceLanguageConfig
     try:
-        auto_detect_config = auto_detect_type()
+        auto_detect_config = auto_detect_type(languages=["cs-CZ", "en-US"])
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(
-            "The installed Speech SDK does not support open-range language detection; "
-            "upgrade azure-cognitiveservices-speech."
+            "The installed Speech SDK does not support constrained language "
+            "auto-detection; upgrade azure-cognitiveservices-speech."
         ) from exc
     return translation_config, auto_detect_config
 
