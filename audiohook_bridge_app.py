@@ -97,6 +97,7 @@ class TranslateAudio(FrameProcessor):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._out_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._pump_task: Optional[asyncio.Task] = None
+        self._shutting_down = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -123,15 +124,40 @@ class TranslateAudio(FrameProcessor):
             return  # raw audio never goes straight to output on this leg
 
         if isinstance(frame, EndFrame):
-            if self._session is not None:
-                self._session.stop()
-            if self._pump_task is not None:
-                self._pump_task.cancel()
-            await broker.unregister(self)
+            partner = self.partner
+            await self._teardown()
+            if partner is not None:
+                logger.info(
+                    f"[{self.label}] Genesys ended this leg - propagating "
+                    f"disconnect to partner [{partner.label}]"
+                )
+                await partner.shutdown_leg()
             await self.push_frame(frame, direction)
             return
 
         await self.push_frame(frame, direction)
+
+    async def _teardown(self) -> None:
+        """Stop this leg's recognizer and unregister from the broker.
+        Idempotent - safe to call whether Genesys ended this leg directly
+        or the partner leg's shutdown triggered it."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        if self._session is not None:
+            self._session.stop()
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+        await broker.unregister(self)
+
+    async def shutdown_leg(self) -> None:
+        """Called on THIS leg when the PARTNER leg's Genesys call ended.
+        Pushes an EndFrame downstream (to our own output transport only,
+        not back through process_frame) so our transport sends a close to
+        Genesys and this call hangs up too - without looping back to
+        notify the partner again."""
+        await self._teardown()
+        await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
     def _on_translated_audio(self, audio: bytes) -> None:
         # Fires on an Azure Speech SDK background thread. Route the
