@@ -98,6 +98,10 @@ class TranslateAudio(FrameProcessor):
         self._out_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._pump_task: Optional[asyncio.Task] = None
         self._shutting_down = False
+        self._task = None  # PipelineTask, injected via set_task() after creation
+
+    def set_task(self, task) -> None:
+        self._task = task
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -124,14 +128,7 @@ class TranslateAudio(FrameProcessor):
             return  # raw audio never goes straight to output on this leg
 
         if isinstance(frame, EndFrame):
-            partner = self.partner
             await self._teardown()
-            if partner is not None:
-                logger.info(
-                    f"[{self.label}] Genesys ended this leg - propagating "
-                    f"disconnect to partner [{partner.label}]"
-                )
-                await partner.shutdown_leg()
             await self.push_frame(frame, direction)
             return
 
@@ -139,8 +136,7 @@ class TranslateAudio(FrameProcessor):
 
     async def _teardown(self) -> None:
         """Stop this leg's recognizer and unregister from the broker.
-        Idempotent - safe to call whether Genesys ended this leg directly
-        or the partner leg's shutdown triggered it."""
+        Idempotent - safe to call multiple times from different triggers."""
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -150,14 +146,28 @@ class TranslateAudio(FrameProcessor):
             self._pump_task.cancel()
         await broker.unregister(self)
 
-    async def shutdown_leg(self) -> None:
-        """Called on THIS leg when the PARTNER leg's Genesys call ended.
-        Pushes an EndFrame downstream (to our own output transport only,
-        not back through process_frame) so our transport sends a close to
-        Genesys and this call hangs up too - without looping back to
-        notify the partner again."""
+    async def handle_disconnect(self) -> None:
+        """Called when THIS leg's websocket actually disconnects (Genesys
+        closed it, or a network drop) - this is the reliable trigger point,
+        not EndFrame, since task.cancel() drives shutdown via CancelFrame
+        internally. Cleans up and forces the partner leg to hang up too."""
+        partner = self.partner
         await self._teardown()
-        await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+        if self._task is not None:
+            await self._task.cancel()
+        if partner is not None:
+            logger.info(
+                f"[{self.label}] ended - propagating disconnect to partner [{partner.label}]"
+            )
+            await partner.force_disconnect()
+
+    async def force_disconnect(self) -> None:
+        """Called on the PARTNER leg to make ITS OWN Genesys call end too,
+        using the same task.cancel() mechanism that reliably closes a leg
+        when Genesys ends it directly."""
+        await self._teardown()
+        if self._task is not None:
+            await self._task.cancel()
 
     def _on_translated_audio(self, audio: bytes) -> None:
         # Fires on an Azure Speech SDK background thread. Route the
@@ -255,16 +265,16 @@ async def audiohook_endpoint(websocket: WebSocket, target_language: str, session
     processor = TranslateAudio(target_language, label)
     pipeline = Pipeline([transport.input(), processor, transport.output()])
     task = PipelineTask(pipeline)
+    processor.set_task(task)
     runner = PipelineRunner()
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client) -> None:
         logger.info(f"[{label}] AudioHook session closed")
-        # Force cleanup here regardless of whether EndFrame ever cleanly
-        # reached the processor - a dropped/abrupt disconnect must not
-        # leave a stale entry in the broker for the next call to pair with.
-        await broker.unregister(processor)
-        await task.cancel()
+        # This is the reliable trigger point (see handle_disconnect
+        # docstring for why EndFrame is not) - cleans up this leg AND
+        # forces the partner leg's call to end too.
+        await processor.handle_disconnect()
 
     await runner.run(task)
 
