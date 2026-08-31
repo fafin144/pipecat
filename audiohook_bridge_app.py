@@ -37,7 +37,14 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket
 from loguru import logger
 
-from pipecat.frames.frames import EndFrame, Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    Frame,
+    InputAudioRawFrame,
+    OutputAudioRawFrame,
+    OutputTransportMessageFrame,
+    StartFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -99,9 +106,13 @@ class TranslateAudio(FrameProcessor):
         self._pump_task: Optional[asyncio.Task] = None
         self._shutting_down = False
         self._task = None  # PipelineTask, injected via set_task() after creation
+        self._serializer = None  # GenesysAudioHookSerializer, injected via set_serializer()
 
     def set_task(self, task) -> None:
         self._task = task
+
+    def set_serializer(self, serializer) -> None:
+        self._serializer = serializer
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -151,23 +162,51 @@ class TranslateAudio(FrameProcessor):
         closed it, or a network drop) - this is the reliable trigger point,
         not EndFrame, since task.cancel() drives shutdown via CancelFrame
         internally. Cleans up and forces the partner leg to hang up too."""
-        partner = self.partner
-        await self._teardown()
-        if self._task is not None:
-            await self._task.cancel()
-        if partner is not None:
-            logger.info(
-                f"[{self.label}] ended - propagating disconnect to partner [{partner.label}]"
-            )
-            await partner.force_disconnect()
+        try:
+            partner = self.partner
+            await self._teardown()
+            if self._task is not None:
+                await self._task.cancel()
+            if partner is not None:
+                logger.info(
+                    f"[{self.label}] ended - propagating disconnect to partner [{partner.label}]"
+                )
+                await partner.force_disconnect()
+            else:
+                logger.info(f"[{self.label}] ended - no partner was set, nothing to propagate")
+        except Exception:
+            logger.exception(f"[{self.label}] handle_disconnect failed")
 
     async def force_disconnect(self) -> None:
-        """Called on the PARTNER leg to make ITS OWN Genesys call end too,
-        using the same task.cancel() mechanism that reliably closes a leg
-        when Genesys ends it directly."""
-        await self._teardown()
-        if self._task is not None:
-            await self._task.cancel()
+        """Called on the PARTNER leg to make ITS OWN Genesys call end too.
+
+        The automatic EndFrame/CancelFrame -> disconnect-message handling
+        in GenesysAudioHookSerializer defaults to action="transfer", which
+        tells Genesys to expect the call to be handed off elsewhere -
+        Genesys then waits (~20s observed) before giving up and hanging up
+        on its own, instead of ending the call immediately. Sending our
+        own disconnect message with action="finished" first avoids that
+        wait entirely.
+        """
+        try:
+            logger.info(f"[{self.label}] force_disconnect invoked by partner")
+            if self._serializer is not None:
+                disconnect_msg = self._serializer.create_disconnect_message(
+                    reason="completed", action="finished"
+                )
+                await self.push_frame(
+                    OutputTransportMessageFrame(message=disconnect_msg),
+                    FrameDirection.DOWNSTREAM,
+                )
+                # Give the message a moment to actually go out over the
+                # wire before we tear down the transport underneath it.
+                await asyncio.sleep(0.1)
+            await self._teardown()
+            if self._task is not None:
+                await self._task.cancel()
+            logger.info(f"[{self.label}] force_disconnect completed")
+        except Exception:
+            logger.exception(f"[{self.label}] force_disconnect failed")
 
     def _on_translated_audio(self, audio: bytes) -> None:
         # Fires on an Azure Speech SDK background thread. Route the
@@ -263,6 +302,7 @@ async def audiohook_endpoint(websocket: WebSocket, target_language: str, session
     )
 
     processor = TranslateAudio(target_language, label)
+    processor.set_serializer(serializer)
     pipeline = Pipeline([transport.input(), processor, transport.output()])
     task = PipelineTask(pipeline)
     processor.set_task(task)
@@ -271,10 +311,13 @@ async def audiohook_endpoint(websocket: WebSocket, target_language: str, session
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client) -> None:
         logger.info(f"[{label}] AudioHook session closed")
-        # This is the reliable trigger point (see handle_disconnect
-        # docstring for why EndFrame is not) - cleans up this leg AND
-        # forces the partner leg's call to end too.
-        await processor.handle_disconnect()
+        try:
+            # This is the reliable trigger point (see handle_disconnect
+            # docstring for why EndFrame is not) - cleans up this leg AND
+            # forces the partner leg's call to end too.
+            await processor.handle_disconnect()
+        except Exception:
+            logger.exception(f"[{label}] on_disconnected handler failed")
 
     await runner.run(task)
 
