@@ -66,6 +66,15 @@ from live_interpreter_session import LiveInterpreterSession
 
 app = FastAPI()
 
+TRIGGER_PHRASE = "hey translate"
+
+
+def _contains_trigger(text: str) -> bool:
+    """Case/punctuation-insensitive substring check for the trigger phrase."""
+    normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+    normalized = " ".join(normalized.split())
+    return TRIGGER_PHRASE in normalized
+
 
 def build_leg_config(target_language: str) -> AppConfig:
     key = os.environ.get("AZURE_SPEECH_KEY", "").strip()
@@ -107,6 +116,7 @@ class TranslateAudio(FrameProcessor):
         self._shutting_down = False
         self._task = None  # PipelineTask, injected via set_task() after creation
         self._serializer = None  # GenesysAudioHookSerializer, injected via set_serializer()
+        self.translation_active = False
 
     def set_task(self, task) -> None:
         self._task = task
@@ -126,6 +136,8 @@ class TranslateAudio(FrameProcessor):
                 config,
                 speechsdk,
                 on_translated_audio=self._on_translated_audio,
+                on_recognizing=self._check_trigger,
+                on_recognized=self._check_trigger,
                 label=self.label,
             )
             self._session.start()
@@ -134,9 +146,22 @@ class TranslateAudio(FrameProcessor):
             return
 
         if isinstance(frame, InputAudioRawFrame):
+            # Always feed the recognizer - it's what watches for the
+            # trigger phrase, and once active, what produces translated
+            # audio. It runs continuously across both phases; nothing
+            # about it needs to restart when the mode switches.
             if self._session is not None:
                 self._session.push_audio(frame.audio)
-            return  # raw audio never goes straight to output on this leg
+
+            if not self.translation_active and self.partner is not None:
+                # Phase 1: no translation yet - relay this leg's raw audio
+                # straight through to the partner, untranslated, so the
+                # call sounds completely normal until the trigger fires.
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(
+                        self.partner._out_queue.put_nowait, frame.audio
+                    )
+            return
 
         if isinstance(frame, EndFrame):
             await self._teardown()
@@ -212,11 +237,43 @@ class TranslateAudio(FrameProcessor):
         # Fires on an Azure Speech SDK background thread. Route the
         # translated audio to the PARTNER leg's outgoing queue - that is
         # what makes this a cross-wired bridge instead of an echo.
+        if not self.translation_active:
+            return  # Phase 1: recognizer is running, but its synthesized
+            # output is discarded - raw audio is relayed instead (see
+            # process_frame's InputAudioRawFrame branch).
         if self.partner is None:
             logger.warning(f"[{self.label}] no partner yet, dropping translated audio")
             return
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self.partner._out_queue.put_nowait, audio)
+
+    def _check_trigger(self, formatted_line: str) -> None:
+        # Called from the LiveInterpreterSession's recognizing/recognized
+        # callbacks - these run on an Azure Speech SDK background thread,
+        # so hop back onto the pipeline's event loop via
+        # run_coroutine_threadsafe rather than touching asyncio state here.
+        if self.translation_active:
+            return
+        if _contains_trigger(formatted_line) and self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._activate_translation(), self._loop)
+
+    async def _activate_translation(self) -> None:
+        """Trigger phrase detected on THIS leg - activate translation on
+        both legs simultaneously so mode switches for the whole call."""
+        if self.translation_active:
+            return
+        self.translation_active = True
+        logger.info(f"[{self.label}] trigger phrase detected - translation now ACTIVE")
+        if self.partner is not None:
+            await self.partner.activate_from_partner()
+
+    async def activate_from_partner(self) -> None:
+        """Called on THIS leg when the PARTNER leg detected the trigger,
+        so both legs switch from raw passthrough to translation together."""
+        if self.translation_active:
+            return
+        self.translation_active = True
+        logger.info(f"[{self.label}] translation now ACTIVE (triggered by partner)")
 
     async def _pump_output(self) -> None:
         while True:
