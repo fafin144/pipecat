@@ -24,8 +24,19 @@ the end of the string you gave it, "?target=en" + "/<uuid>" -> broken
 Required Render environment variables:
   AZURE_SPEECH_KEY
   AZURE_SPEECH_RESOURCE_NAME   (e.g. voicebots-speech-byos)
+  ANTHROPIC_API_KEY            (for the "Hey AI Agent" assistant)
 Optional:
   AZURE_SPEECH_VOICE
+  AGENT_VOICE                  (voice for the AI agent's spoken answers,
+                                 default: en-US-JennyNeural)
+
+Two trigger phrases, either can be said on either leg:
+  "Hey Translate" -> activates bidirectional live translation (both legs,
+                      persists for the rest of the call)
+  "Hey AI Agent"   -> asks a question (either in the same utterance, e.g.
+                      "Hey AI Agent, what's the weather in London", or in
+                      the next utterance if said alone) and plays Claude's
+                      answer to BOTH legs, muting normal audio meanwhile
 """
 
 from __future__ import annotations
@@ -63,17 +74,33 @@ from sample_code import (
     resolve_voice_name,
 )
 from live_interpreter_session import LiveInterpreterSession
+from agent_assistant import ask_agent
 
 app = FastAPI()
 
 TRIGGER_PHRASE = "hey translate"
+AGENT_TRIGGER_PHRASE = "hey ai agent"
 
 
-def _contains_trigger(text: str) -> bool:
-    """Case/punctuation-insensitive substring check for the trigger phrase."""
+def _normalize(text: str) -> str:
     normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-    normalized = " ".join(normalized.split())
-    return TRIGGER_PHRASE in normalized
+    return " ".join(normalized.split())
+
+
+def _contains_trigger(text: str, phrase: str) -> bool:
+    """Case/punctuation-insensitive substring check for a trigger phrase."""
+    return phrase in _normalize(text)
+
+
+def _extract_after_trigger(text: str, phrase: str) -> Optional[str]:
+    """If `phrase` appears in `text`, return whatever comes after it
+    (may be an empty string if the trigger was the entire utterance).
+    Returns None if the phrase isn't present at all."""
+    normalized = _normalize(text)
+    idx = normalized.find(phrase)
+    if idx == -1:
+        return None
+    return normalized[idx + len(phrase):].strip()
 
 
 def build_leg_config(target_language: str) -> AppConfig:
@@ -99,6 +126,38 @@ def build_leg_config(target_language: str) -> AppConfig:
     )
 
 
+async def synthesize_speech(text: str) -> bytes:
+    """Plain text-to-speech for the agent's answer (separate from the
+    TranslationRecognizer sessions, which are for cs<->en interpretation).
+
+    Uses the resource's standard endpoint (not the /stt/speech/universal/v2
+    path used for Live Interpreter) - a plain SpeechSynthesizer is not
+    guaranteed to work against that specialized path. Runs the blocking
+    Speech SDK call in a thread so it doesn't block the event loop.
+    """
+    speechsdk = load_speech_sdk()
+    key = os.environ.get("AZURE_SPEECH_KEY", "").strip()
+    resource_name = os.environ.get("AZURE_SPEECH_RESOURCE_NAME", "").strip()
+    voice = os.environ.get("AGENT_VOICE", "en-US-JennyNeural")
+
+    def _synth() -> bytes:
+        speech_config = speechsdk.SpeechConfig(
+            subscription=key,
+            endpoint=f"https://{resource_name}.cognitiveservices.azure.com/",
+        )
+        speech_config.speech_synthesis_voice_name = voice
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm
+        )
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+        result = synthesizer.speak_text_async(text).get()
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            return bytes(result.audio_data)
+        return b""
+
+    return await asyncio.to_thread(_synth)
+
+
 class TranslateAudio(FrameProcessor):
     """One leg of the bridge: recognizes+translates this leg's audio and
     sends the synthesized result to the PARTNER leg's output, not its own."""
@@ -117,6 +176,8 @@ class TranslateAudio(FrameProcessor):
         self._task = None  # PipelineTask, injected via set_task() after creation
         self._serializer = None  # GenesysAudioHookSerializer, injected via set_serializer()
         self.translation_active = False
+        self.agent_busy = False
+        self.awaiting_agent_question = False
 
     def set_task(self, task) -> None:
         self._task = task
@@ -136,8 +197,8 @@ class TranslateAudio(FrameProcessor):
                 config,
                 speechsdk,
                 on_translated_audio=self._on_translated_audio,
-                on_recognizing=self._check_trigger,
-                on_recognized=self._check_trigger,
+                on_recognizing=self._check_translate_trigger,
+                on_recognized=self._on_recognized_final,
                 label=self.label,
             )
             self._session.start()
@@ -153,7 +214,7 @@ class TranslateAudio(FrameProcessor):
             if self._session is not None:
                 self._session.push_audio(frame.audio)
 
-            if not self.translation_active and self.partner is not None:
+            if not self.translation_active and not self.agent_busy and self.partner is not None:
                 # Phase 1: no translation yet - relay this leg's raw audio
                 # straight through to the partner, untranslated, so the
                 # call sounds completely normal until the trigger fires.
@@ -237,25 +298,78 @@ class TranslateAudio(FrameProcessor):
         # Fires on an Azure Speech SDK background thread. Route the
         # translated audio to the PARTNER leg's outgoing queue - that is
         # what makes this a cross-wired bridge instead of an echo.
-        if not self.translation_active:
-            return  # Phase 1: recognizer is running, but its synthesized
-            # output is discarded - raw audio is relayed instead (see
-            # process_frame's InputAudioRawFrame branch).
+        if not self.translation_active or self.agent_busy:
+            return  # Phase 1, or the AI agent is currently speaking - either
+            # way, this leg's synthesized output should not go out right now.
         if self.partner is None:
             logger.warning(f"[{self.label}] no partner yet, dropping translated audio")
             return
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self.partner._out_queue.put_nowait, audio)
 
-    def _check_trigger(self, formatted_line: str) -> None:
-        # Called from the LiveInterpreterSession's recognizing/recognized
-        # callbacks - these run on an Azure Speech SDK background thread,
-        # so hop back onto the pipeline's event loop via
-        # run_coroutine_threadsafe rather than touching asyncio state here.
+    def _check_translate_trigger(self, text: str) -> None:
+        # Called from LiveInterpreterSession's recognizing callback (partial
+        # results) - fires on an Azure Speech SDK background thread, so hop
+        # back onto the pipeline's event loop via run_coroutine_threadsafe.
         if self.translation_active:
             return
-        if _contains_trigger(formatted_line) and self._loop is not None:
+        if _contains_trigger(text, TRIGGER_PHRASE) and self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._activate_translation(), self._loop)
+
+    def _on_recognized_final(self, text: str) -> None:
+        # Final recognized text: re-check the translate trigger (in case it
+        # was missed on partial results), and separately handle the AI
+        # agent flow, which needs a clean, complete utterance.
+        self._check_translate_trigger(text)
+
+        if self._loop is None:
+            return
+
+        if self.awaiting_agent_question:
+            asyncio.run_coroutine_threadsafe(self._handle_agent_question(text), self._loop)
+            return
+
+        remainder = _extract_after_trigger(text, AGENT_TRIGGER_PHRASE)
+        if remainder is None:
+            return  # agent trigger phrase not present in this utterance
+        if remainder:
+            # "Hey AI Agent, what's the weather in London" said in one go.
+            asyncio.run_coroutine_threadsafe(self._handle_agent_question(remainder), self._loop)
+        else:
+            # Trigger said alone - capture the NEXT utterance as the question.
+            self.awaiting_agent_question = True
+            logger.info(f"[{self.label}] AI agent trigger detected, awaiting question...")
+
+    async def _handle_agent_question(self, question: str) -> None:
+        self.awaiting_agent_question = False
+        logger.info(f"[{self.label}] asking AI agent: {question!r}")
+        self.agent_busy = True
+        if self.partner is not None:
+            self.partner.agent_busy = True
+        try:
+            answer = await ask_agent(question)
+        except Exception:
+            logger.exception(f"[{self.label}] agent call failed")
+            answer = "Sorry, something went wrong answering that."
+        logger.info(f"[{self.label}] agent answered: {answer!r}")
+        try:
+            audio = await synthesize_speech(answer)
+            if audio:
+                # Both parties hear the answer - push to this leg's own
+                # output queue AND the partner's, since we're already
+                # running on the pipeline's event loop here (no thread
+                # hop needed, unlike the SDK-thread callbacks above).
+                self._out_queue.put_nowait(audio)
+                if self.partner is not None:
+                    self.partner._out_queue.put_nowait(audio)
+            else:
+                logger.warning(f"[{self.label}] agent TTS produced no audio")
+        except Exception:
+            logger.exception(f"[{self.label}] agent TTS failed")
+        finally:
+            self.agent_busy = False
+            if self.partner is not None:
+                self.partner.agent_busy = False
 
     async def _activate_translation(self) -> None:
         """Trigger phrase detected on THIS leg - activate translation on

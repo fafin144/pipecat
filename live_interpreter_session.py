@@ -124,13 +124,13 @@ class LiveInterpreterSession:
         line = format_recognizing_event(event)
         print(f"[{self.label}] {line}")
         if self._on_recognizing:
-            self._on_recognizing(line)
+            self._on_recognizing(getattr(event.result, "text", "") or "")
 
     def _handle_recognized(self, event: Any) -> None:
         line = format_recognized_event(event, self._speechsdk)
         print(f"[{self.label}] {line}")
         if self._on_recognized:
-            self._on_recognized(line)
+            self._on_recognized(getattr(event.result, "text", "") or "")
 
     def _handle_synthesizing(self, event: Any) -> None:
         audio = bytes(getattr(event.result, "audio", b"") or b"")
