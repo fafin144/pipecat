@@ -4,3 +4,5 @@ pipecat-ai[websocket]
 soxr
 loguru
 azure-cognitiveservices-speech
+anthropic
+httpx
