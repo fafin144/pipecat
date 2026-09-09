@@ -402,12 +402,19 @@ class TranslateAudio(FrameProcessor):
         logger.info(f"[{self.label}] translation now ACTIVE (triggered by partner)")
 
     async def _pump_output(self) -> None:
+        # 16kHz, 16-bit, mono PCM = 32000 bytes/second. Azure's TTS can
+        # generate audio faster than real-time and deliver it in quick
+        # bursts via the synthesizing event - without pacing, we'd blast
+        # that whole burst to Genesys far faster than real-time playback,
+        # which is what was tripping the AudioHook rate limit (429).
+        bytes_per_second = 16000 * 2
         while True:
             audio = await self._out_queue.get()
             await self.push_frame(
                 OutputAudioRawFrame(audio=audio, sample_rate=16000, num_channels=1),
                 FrameDirection.DOWNSTREAM,
             )
+            await asyncio.sleep(len(audio) / bytes_per_second)
 
 
 class PairBroker:
