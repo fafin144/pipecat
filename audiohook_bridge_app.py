@@ -80,6 +80,10 @@ app = FastAPI()
 
 TRIGGER_PHRASE = "hey translate"
 AGENT_TRIGGER_PHRASE = "hey ai agent"
+# ~100ms at 16kHz/16-bit mono - batches raw passthrough audio into fewer,
+# larger outbound messages instead of relaying every small input frame
+# immediately, which was tripping Genesys's AudioHook rate limit (429).
+PASSTHROUGH_CHUNK_BYTES = 3200
 
 
 def _normalize(text: str) -> str:
@@ -178,6 +182,7 @@ class TranslateAudio(FrameProcessor):
         self.translation_active = False
         self.agent_busy = False
         self.awaiting_agent_question = False
+        self._passthrough_buffer = bytearray()
 
     def set_task(self, task) -> None:
         self._task = task
@@ -218,10 +223,17 @@ class TranslateAudio(FrameProcessor):
                 # Phase 1: no translation yet - relay this leg's raw audio
                 # straight through to the partner, untranslated, so the
                 # call sounds completely normal until the trigger fires.
-                if self._loop is not None:
-                    self._loop.call_soon_threadsafe(
-                        self.partner._out_queue.put_nowait, frame.audio
-                    )
+                # Buffered into larger chunks rather than sent per-frame -
+                # relaying every small input frame immediately tripped
+                # Genesys's AudioHook rate limit (429 Rate limit exceeded).
+                self._passthrough_buffer.extend(frame.audio)
+                if len(self._passthrough_buffer) >= PASSTHROUGH_CHUNK_BYTES:
+                    chunk = bytes(self._passthrough_buffer)
+                    self._passthrough_buffer.clear()
+                    if self._loop is not None:
+                        self._loop.call_soon_threadsafe(
+                            self.partner._out_queue.put_nowait, chunk
+                        )
             return
 
         if isinstance(frame, EndFrame):
