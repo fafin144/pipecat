@@ -42,6 +42,7 @@ Two trigger phrases, either can be said on either leg:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import os
 from typing import Optional
 
@@ -78,8 +79,8 @@ from agent_assistant import ask_agent
 
 app = FastAPI()
 
-TRIGGER_PHRASE = "hey translate"
-AGENT_TRIGGER_PHRASE = "hey ai agent"
+TRANSLATE_TRIGGER_PHRASES = ["hey translate", "hej překládej"]
+AGENT_TRIGGER_PHRASES = ["hey ai agent", "hej počasí"]
 # ~100ms at 16kHz/16-bit mono - batches raw passthrough audio into fewer,
 # larger outbound messages instead of relaying every small input frame
 # immediately, which was tripping Genesys's AudioHook rate limit (429).
@@ -91,20 +92,43 @@ def _normalize(text: str) -> str:
     return " ".join(normalized.split())
 
 
-def _contains_trigger(text: str, phrase: str) -> bool:
-    """Case/punctuation-insensitive substring check for a trigger phrase."""
-    return phrase in _normalize(text)
-
-
-def _extract_after_trigger(text: str, phrase: str) -> Optional[str]:
-    """If `phrase` appears in `text`, return whatever comes after it
-    (may be an empty string if the trigger was the entire utterance).
-    Returns None if the phrase isn't present at all."""
-    normalized = _normalize(text)
-    idx = normalized.find(phrase)
-    if idx == -1:
+def _find_trigger_fuzzy(text: str, phrase: str, threshold: float = 0.72) -> Optional[str]:
+    """Sliding-window fuzzy match for a short trigger phrase within
+    recognized text. Tolerant of STT mis-transcription ("hey" -> "hi",
+    "AI" -> "aaj", accent artifacts, etc.) - exact substring matching was
+    missing real trigger attempts because of exactly this kind of noise.
+    Returns the text after the best-matching window if it clears the
+    similarity threshold, or None if nothing matched well enough."""
+    words = _normalize(text).split()
+    phrase_words = phrase.split()
+    n = len(phrase_words)
+    if len(words) < n:
         return None
-    return normalized[idx + len(phrase):].strip()
+    best_ratio = 0.0
+    best_end = None
+    for i in range(len(words) - n + 1):
+        window = " ".join(words[i : i + n])
+        ratio = difflib.SequenceMatcher(None, window, phrase).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_end = i + n
+    if best_ratio >= threshold and best_end is not None:
+        return " ".join(words[best_end:]).strip()
+    return None
+
+
+def _contains_any_trigger(text: str, phrases: list[str]) -> bool:
+    return any(_find_trigger_fuzzy(text, phrase) is not None for phrase in phrases)
+
+
+def _extract_after_any_trigger(text: str, phrases: list[str]) -> Optional[str]:
+    """Try each phrase variant in turn, return the remainder from the
+    first one that matches well enough, or None if none did."""
+    for phrase in phrases:
+        remainder = _find_trigger_fuzzy(text, phrase)
+        if remainder is not None:
+            return remainder
+    return None
 
 
 def build_leg_config(target_language: str) -> AppConfig:
@@ -325,7 +349,7 @@ class TranslateAudio(FrameProcessor):
         # back onto the pipeline's event loop via run_coroutine_threadsafe.
         if self.translation_active:
             return
-        if _contains_trigger(text, TRIGGER_PHRASE) and self._loop is not None:
+        if _contains_any_trigger(text, TRANSLATE_TRIGGER_PHRASES) and self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._activate_translation(), self._loop)
 
     def _on_recognized_final(self, text: str) -> None:
@@ -341,7 +365,7 @@ class TranslateAudio(FrameProcessor):
             asyncio.run_coroutine_threadsafe(self._handle_agent_question(text), self._loop)
             return
 
-        remainder = _extract_after_trigger(text, AGENT_TRIGGER_PHRASE)
+        remainder = _extract_after_any_trigger(text, AGENT_TRIGGER_PHRASES)
         if remainder is None:
             return  # agent trigger phrase not present in this utterance
         if remainder:
